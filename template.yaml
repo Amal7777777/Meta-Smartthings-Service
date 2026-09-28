@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: WhatsApp AI orchestrator - Claude on Amazon Bedrock with SmartThings, reminders, lists, voice notes and more
+
+# Build first (npm run build), then: sam deploy --guided
+# CodeUri points at the esbuild bundles in dist/, so no `sam build` step is needed.
+
+Parameters:
+  WhatsAppPhoneNumberId:
+    Type: String
+    Description: Phone number id of the WhatsApp business number (Meta dashboard > WhatsApp > API Setup)
+  AllowedSenders:
+    Type: String
+    Description: Comma-separated WhatsApp numbers allowed to use the bot, country code first, no "+" (e.g. 919876543210)
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-opus-5
+    Description: Bedrock model id used by the orchestrator
+  ModelEffort:
+    Type: String
+    Default: medium
+    AllowedValues: [low, medium, high, "off"]
+    Description: Ignored for Haiku models, which don't support it
+  WhatsAppGraphApiVersion:
+    Type: String
+    Default: v23.0
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    Handler: index.handler
+    MemorySize: 512
+    LoggingConfig:
+      LogFormat: JSON
+    Environment:
+      Variables:
+        APP_SECRET_ARN: !Ref AppSecret
+        NODE_OPTIONS: --enable-source-maps
+
+Resources:
+  # Fill in after the first deploy (see README). CloudFormation only sets this placeholder once.
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: WhatsApp and SmartThings credentials for the orchestrator
+      SecretString: '{"WHATSAPP_VERIFY_TOKEN":"","WHATSAPP_APP_SECRET":"","WHATSAPP_ACCESS_TOKEN":"","SMARTTHINGS_PAT":""}'
+
+  ConversationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  MessageDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+
+  MessageQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      # Needed for EventBridge Scheduler to deliver reminders here; the webhook still sets its own dedup ids.
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 1080 # 6x the processor timeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MessageDLQ.Arn
+        maxReceiveCount: 3
+
+  # Reminders and scheduled tasks: one-time EventBridge schedules that drop a message on MessageQueue.
+  ReminderScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-reminders"
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: send-to-message-queue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt MessageQueue.Arn
+
+  # Voice notes are staged here for Amazon Transcribe and deleted right after; the lifecycle rule is a backstop.
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-media
+            Status: Enabled
+            ExpirationInDays: 1
+
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: dist/webhook
+      Timeout: 10
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref MessageQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt MessageQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref AppSecret
+      Events:
+        Verify:
+          Type: HttpApi
+          Properties:
+            Path: /webhook
+            Method: GET
+        Receive:
+          Type: HttpApi
+          Properties:
+            Path: /webhook
+            Method: POST
+
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: dist/processor
+      Timeout: 180 # voice notes wait on Amazon Transcribe
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ConversationTable
+          WHATSAPP_PHONE_NUMBER_ID: !Ref WhatsAppPhoneNumberId
+          WHATSAPP_GRAPH_API_VERSION: !Ref WhatsAppGraphApiVersion
+          ALLOWED_SENDERS: !Ref AllowedSenders
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          MODEL_EFFORT: !Ref ModelEffort
+          SCHEDULE_GROUP: !Ref ReminderScheduleGroup
+          QUEUE_ARN: !GetAtt MessageQueue.Arn
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerRole.Arn
+          MEDIA_BUCKET: !Ref MediaBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConversationTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref AppSecret
+        - Statement:
+            # Claude on Bedrock via the bedrock-mantle (Messages API) endpoint.
+            # Tighten Resource to the model/inference-profile ARNs once you've settled on a model.
+            - Effect: Allow
+              Action:
+                - bedrock-mantle:*
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - scheduler:CreateSchedule
+                - scheduler:GetSchedule
+                - scheduler:DeleteSchedule
+              Resource: !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ReminderScheduleGroup}/*"
+            - Effect: Allow
+              Action: scheduler:ListSchedules
+              Resource: "*"
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt SchedulerRole.Arn
+            - Effect: Allow
+              Action:
+                - transcribe:StartTranscriptionJob
+                - transcribe:GetTranscriptionJob
+                - transcribe:DeleteTranscriptionJob
+              Resource: "*"
+        - S3CrudPolicy:
+            BucketName: !Ref MediaBucket
+      Events:
+        Messages:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MessageQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+Outputs:
+  WebhookUrl:
+    Description: Paste this into Meta dashboard > WhatsApp > Configuration > Callback URL
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/webhook"
+  AppSecretArn:
+    Description: Put your tokens in this secret
+    Value: !Ref AppSecret
+  DeadLetterQueueUrl:
+    Value: !Ref MessageDLQ
